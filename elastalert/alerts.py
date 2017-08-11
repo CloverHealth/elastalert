@@ -245,6 +245,10 @@ class Alerter(object):
                 body += '\n----------------------------------------\n'
         return body
 
+    def get_aggregation_summary_text__maximum_width(self):
+        """Get maximum width allowed for summary text."""
+        return 80
+
     def get_aggregation_summary_text(self, matches):
         text = ''
         if 'aggregation' in self.rule and 'summary_table_fields' in self.rule:
@@ -256,7 +260,7 @@ class Alerter(object):
             text += "Aggregation resulted in the following data for summary_table_fields ==> {0}:\n\n".format(
                 summary_table_fields_with_count
             )
-            text_table = Texttable()
+            text_table = Texttable(width=self.get_aggregation_summary_text__maximum_width())
             text_table.header(summary_table_fields_with_count)
             match_aggregation = {}
 
