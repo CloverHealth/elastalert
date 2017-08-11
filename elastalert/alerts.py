@@ -999,6 +999,15 @@ class SlackAlerter(Alerter):
         body = body.replace('>', '&gt;')
         return body
 
+    def get_aggregation_summary_text__maximum_width(self):
+        return 75
+
+    def get_aggregation_summary_text(self, matches):
+        text = super(SlackAlerter, self).get_aggregation_summary_text(matches)
+        if text:
+            text = u'```\n{0}```\n'.format(text)
+        return text
+
     def alert(self, matches):
         body = self.create_alert_body(matches)
 
