@@ -29,6 +29,8 @@ from util import EAException
 from util import elastalert_logger
 from util import lookup_es_key
 from util import pretty_ts
+from util import ts_now
+from util import ts_to_dt
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -365,6 +367,8 @@ class EmailAlerter(Alerter):
         self.smtp_port = self.rule.get('smtp_port')
         if self.rule.get('smtp_auth_file'):
             self.get_account(self.rule['smtp_auth_file'])
+        self.smtp_key_file = self.rule.get('smtp_key_file')
+        self.smtp_cert_file = self.rule.get('smtp_cert_file')
         # Convert email to a list if it isn't already
         if isinstance(self.rule['email'], basestring):
             self.rule['email'] = [self.rule['email']]
@@ -415,9 +419,9 @@ class EmailAlerter(Alerter):
         try:
             if self.smtp_ssl:
                 if self.smtp_port:
-                    self.smtp = SMTP_SSL(self.smtp_host, self.smtp_port)
+                    self.smtp = SMTP_SSL(self.smtp_host, self.smtp_port, keyfile=self.smtp_key_file, certfile=self.smtp_cert_file)
                 else:
-                    self.smtp = SMTP_SSL(self.smtp_host)
+                    self.smtp = SMTP_SSL(self.smtp_host, keyfile=self.smtp_key_file, certfile=self.smtp_cert_file)
             else:
                 if self.smtp_port:
                     self.smtp = SMTP(self.smtp_host, self.smtp_port)
@@ -425,7 +429,7 @@ class EmailAlerter(Alerter):
                     self.smtp = SMTP(self.smtp_host)
                 self.smtp.ehlo()
                 if self.smtp.has_extn('STARTTLS'):
-                    self.smtp.starttls()
+                    self.smtp.starttls(keyfile=self.smtp_key_file, certfile=self.smtp_cert_file)
             if 'smtp_auth_file' in self.rule:
                 self.smtp.login(self.user, self.password)
         except (SMTPException, error) as e:
@@ -462,6 +466,7 @@ class JiraAlerter(Alerter):
     known_field_list = [
         'jira_account_file',
         'jira_assignee',
+        'jira_bump_after_inactivity',
         'jira_bump_in_statuses',
         'jira_bump_not_in_statuses',
         'jira_bump_tickets',
@@ -498,6 +503,10 @@ class JiraAlerter(Alerter):
         self.project = self.rule['jira_project']
         self.issue_type = self.rule['jira_issuetype']
 
+        # Deferred settings refer to values that can only be resolved when a match
+        # is found and as such loading them will be delayed until we find a match
+        self.deferred_settings = []
+
         # We used to support only a single component. This allows us to maintain backwards compatibility
         # while also giving the user-facing API a more representative name
         self.components = self.rule.get('jira_components', self.rule.get('jira_component'))
@@ -513,6 +522,7 @@ class JiraAlerter(Alerter):
         self.bump_tickets = self.rule.get('jira_bump_tickets', False)
         self.bump_not_in_statuses = self.rule.get('jira_bump_not_in_statuses')
         self.bump_in_statuses = self.rule.get('jira_bump_in_statuses')
+        self.bump_after_inactivity = self.rule.get('jira_bump_after_inactivity', 0)
         self.watchers = self.rule.get('jira_watchers')
 
         if self.bump_in_statuses and self.bump_not_in_statuses:
@@ -560,6 +570,70 @@ class JiraAlerter(Alerter):
         except KeyError:
             logging.error("Priority %s not found. Valid priorities are %s" % (self.priority, self.priority_ids.keys()))
 
+    def set_jira_arg(self, jira_field, value, fields):
+        # Remove the jira_ part.  Convert underscores to spaces
+        normalized_jira_field = jira_field[5:].replace('_', ' ').lower()
+        # All jira fields should be found in the 'id' or the 'name' field. Therefore, try both just in case
+        for identifier in ['name', 'id']:
+            field = next((f for f in fields if normalized_jira_field == f[identifier].replace('_', ' ').lower()), None)
+            if field:
+                break
+        if not field:
+            # Log a warning to ElastAlert saying that we couldn't find that type?
+            # OR raise and fail to load the alert entirely? Probably the latter...
+            raise Exception("Could not find a definition for the jira field '{0}'".format(normalized_jira_field))
+        arg_name = field['id']
+        # Check the schema information to decide how to set the value correctly
+        # If the schema information is not available, raise an exception since we don't know how to set it
+        # Note this is only the case for two built-in types, id: issuekey and id: thumbnail
+        if not ('schema' in field or 'type' in field['schema']):
+            raise Exception("Could not determine schema information for the jira field '{0}'".format(normalized_jira_field))
+        arg_type = field['schema']['type']
+
+        # Handle arrays of simple types like strings or numbers
+        if arg_type == 'array':
+            # As a convenience, support the scenario wherein the user only provides
+            # a single value for a multi-value field e.g. jira_labels: Only_One_Label
+            if type(value) != list:
+                value = [value]
+            array_items = field['schema']['items']
+            # Simple string types
+            if array_items in ['string', 'date', 'datetime']:
+                # Special case for multi-select custom types (the JIRA metadata says that these are strings, but
+                # in reality, they are required to be provided as an object.
+                if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
+                    self.jira_args[arg_name] = [{'value': v} for v in value]
+                else:
+                    self.jira_args[arg_name] = value
+            elif array_items == 'number':
+                self.jira_args[arg_name] = [int(v) for v in value]
+            # Also attempt to handle arrays of complex types that have to be passed as objects with an identifier 'key'
+            elif array_items == 'option':
+                self.jira_args[arg_name] = [{'value': v} for v in value]
+            else:
+                # Try setting it as an object, using 'name' as the key
+                # This may not work, as the key might actually be 'key', 'id', 'value', or something else
+                # If it works, great!  If not, it will manifest itself as an API error that will bubble up
+                self.jira_args[arg_name] = [{'name': v} for v in value]
+        # Handle non-array types
+        else:
+            # Simple string types
+            if arg_type in ['string', 'date', 'datetime']:
+                # Special case for custom types (the JIRA metadata says that these are strings, but
+                # in reality, they are required to be provided as an object.
+                if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
+                    self.jira_args[arg_name] = {'value': value}
+                else:
+                    self.jira_args[arg_name] = value
+            # Number type
+            elif arg_type == 'number':
+                self.jira_args[arg_name] = int(value)
+            elif arg_type == 'option':
+                self.jira_args[arg_name] = {'value': value}
+            # Complex type
+            else:
+                self.jira_args[arg_name] = {'name': value}
+
     def get_arbitrary_fields(self):
         # This API returns metadata about all the fields defined on the jira server (built-ins and custom ones)
         fields = self.client.fields()
@@ -567,69 +641,10 @@ class JiraAlerter(Alerter):
             # If we find a field that is not covered by the set that we are aware of, it means it is either:
             # 1. A built-in supported field in JIRA that we don't have on our radar
             # 2. A custom field that a JIRA admin has configured
-            if jira_field.startswith('jira_') and jira_field not in self.known_field_list:
-                # Remove the jira_ part.  Convert underscores to spaces
-                normalized_jira_field = jira_field[5:].replace('_', ' ').lower()
-                # All jira fields should be found in the 'id' or the 'name' field. Therefore, try both just in case
-                for identifier in ['name', 'id']:
-                    field = next((f for f in fields if normalized_jira_field == f[identifier].replace('_', ' ').lower()), None)
-                    if field:
-                        break
-                if not field:
-                    # Log a warning to ElastAlert saying that we couldn't find that type?
-                    # OR raise and fail to load the alert entirely? Probably the latter...
-                    raise Exception("Could not find a definition for the jira field '{0}'".format(normalized_jira_field))
-                arg_name = field['id']
-                # Check the schema information to decide how to set the value correctly
-                # If the schema information is not available, raise an exception since we don't know how to set it
-                # Note this is only the case for two built-in types, id: issuekey and id: thumbnail
-                if not ('schema' in field or 'type' in field['schema']):
-                    raise Exception("Could not determine schema information for the jira field '{0}'".format(normalized_jira_field))
-                arg_type = field['schema']['type']
-
-                # Handle arrays of simple types like strings or numbers
-                if arg_type == 'array':
-                    # As a convenience, support the scenario wherein the user only provides
-                    # a single value for a multi-value field e.g. jira_labels: Only_One_Label
-                    if type(value) != list:
-                        value = [value]
-                    array_items = field['schema']['items']
-                    # Simple string types
-                    if array_items in ['string', 'date', 'datetime']:
-                        # Special case for multi-select custom types (the JIRA metadata says that these are strings, but
-                        # in reality, they are required to be provided as an object.
-                        if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
-                            self.jira_args[arg_name] = [{'value': v} for v in value]
-                        else:
-                            self.jira_args[arg_name] = value
-                    elif array_items == 'number':
-                        self.jira_args[arg_name] = [int(v) for v in value]
-                    # Also attempt to handle arrays of complex types that have to be passed as objects with an identifier 'key'
-                    elif array_items == 'option':
-                        self.jira_args[arg_name] = [{'value': v} for v in value]
-                    else:
-                        # Try setting it as an object, using 'name' as the key
-                        # This may not work, as the key might actually be 'key', 'id', 'value', or something else
-                        # If it works, great!  If not, it will manifest itself as an API error that will bubble up
-                        self.jira_args[arg_name] = [{'name': v} for v in value]
-                # Handle non-array types
-                else:
-                    # Simple string types
-                    if arg_type in ['string', 'date', 'datetime']:
-                        # Special case for custom types (the JIRA metadata says that these are strings, but
-                        # in reality, they are required to be provided as an object.
-                        if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
-                            self.jira_args[arg_name] = {'value': value}
-                        else:
-                            self.jira_args[arg_name] = value
-                    # Number type
-                    elif arg_type == 'number':
-                        self.jira_args[arg_name] = int(value)
-                    elif arg_type == 'option':
-                        self.jira_args[arg_name] = {'value': value}
-                    # Complex type
-                    else:
-                        self.jira_args[arg_name] = {'name': value}
+            if jira_field.startswith('jira_') and jira_field not in self.known_field_list and str(value)[:1] != '#':
+                self.set_jira_arg(jira_field, value, fields)
+            if jira_field.startswith('jira_') and jira_field not in self.known_field_list and str(value)[:1] == '#':
+                self.deferred_settings.append(jira_field)
 
     def get_priorities(self):
         """ Creates a mapping of priority index to id. """
@@ -682,11 +697,23 @@ class JiraAlerter(Alerter):
         self.client.add_comment(ticket, comment)
 
     def alert(self, matches):
+        if len(self.deferred_settings) > 0:
+            fields = self.client.fields()
+            for jira_field in self.deferred_settings:
+                value = lookup_es_key(matches[0], self.rule[jira_field][1:])
+                self.set_jira_arg(jira_field, value, fields)
+
         title = self.create_title(matches)
 
         if self.bump_tickets:
             ticket = self.find_existing_ticket(matches)
             if ticket:
+                inactivity_datetime = ts_now() - datetime.timedelta(days=self.bump_after_inactivity)
+                if ts_to_dt(ticket.fields.updated) >= inactivity_datetime:
+                    if self.pipeline is not None:
+                        self.pipeline['jira_ticket'] = None
+                        self.pipeline['jira_server'] = self.server
+                    return None
                 elastalert_logger.info('Commenting on existing ticket %s' % (ticket.key))
                 for match in matches:
                     try:
@@ -1045,7 +1072,7 @@ class PagerDutyAlerter(Alerter):
         headers = {'content-type': 'application/json'}
         payload = {
             'service_key': self.pagerduty_service_key,
-            'description': self.rule['name'],
+            'description': self.create_title(matches),
             'event_type': 'trigger',
             'incident_key': self.get_incident_key(matches),
             'client': self.pagerduty_client_name,
@@ -1323,33 +1350,41 @@ class ServiceNowAlerter(Alerter):
                 'self.servicenow_rest_url': self.servicenow_rest_url}
 
 
-class SimplePostAlerter(Alerter):
+class HTTPPostAlerter(Alerter):
+    """ Requested elasticsearch indices are sent by HTTP POST. Encoded with JSON. """
+
     def __init__(self, rule):
-        super(SimplePostAlerter, self).__init__(rule)
-        simple_webhook_url = self.rule.get('simple_webhook_url')
-        if isinstance(simple_webhook_url, basestring):
-            simple_webhook_url = [simple_webhook_url]
-        self.simple_webhook_url = simple_webhook_url
-        self.simple_proxy = self.rule.get('simple_proxy')
+        super(HTTPPostAlerter, self).__init__(rule)
+        post_url = self.rule.get('http_post_url')
+        if isinstance(post_url, basestring):
+            post_url = [post_url]
+        self.post_url = post_url
+        self.post_proxy = self.rule.get('http_post_proxy')
+        self.post_payload = self.rule.get('http_post_payload', {})
+        self.post_static_payload = self.rule.get('http_post_static_payload', {})
+        self.post_all_values = self.rule.get('http_post_all_values', not self.post_payload)
 
     def alert(self, matches):
-        payload = {
-            'rule': self.rule['name'],
-            'matches': matches
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json;charset=utf-8"
-        }
-        proxies = {'https': self.simple_proxy} if self.simple_proxy else None
-        for url in self.simple_webhook_url:
-            try:
-                response = requests.post(url, data=json.dumps(payload, cls=DateTimeEncoder), headers=headers, proxies=proxies)
-                response.raise_for_status()
-            except RequestException as e:
-                raise EAException("Error posting simple alert: %s" % e)
-        elastalert_logger.info("Simple alert sent")
+        """ Each match will trigger a POST to the specified endpoint(s). """
+        for match in matches:
+            payload = match if self.post_all_values else {}
+            payload.update(self.post_static_payload)
+            for post_key, es_key in self.post_payload.items():
+                payload[post_key] = lookup_es_key(match, es_key)
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json;charset=utf-8"
+            }
+            proxies = {'https': self.post_proxy} if self.post_proxy else None
+            for url in self.post_url:
+                try:
+                    response = requests.post(url, data=json.dumps(payload, cls=DateTimeEncoder),
+                                             headers=headers, proxies=proxies)
+                    response.raise_for_status()
+                except RequestException as e:
+                    raise EAException("Error posting HTTP Post alert: %s" % e)
+            elastalert_logger.info("HTTP Post alert sent.")
 
     def get_info(self):
-        return {'type': 'simple',
-                'simple_webhook_url': self.simple_webhook_url}
+        return {'type': 'http_post',
+                'http_post_webhook_url': self.post_url}
